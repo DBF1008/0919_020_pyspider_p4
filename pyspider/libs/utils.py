@@ -9,6 +9,8 @@ import math
 import logging
 import hashlib
 import datetime
+import os
+import signal
 import socket
 import base64
 import warnings
@@ -58,6 +60,43 @@ def run_in_thread(func, *args, **kwargs):
     thread.daemon = True
     thread.start()
     return thread
+
+
+def install_graceful_shutdown(quit_func, logger=None, signals=('SIGTERM', 'SIGINT')):
+    """
+    Install signal handlers for graceful shutdown.
+
+    The first signal triggers `quit_func` so that components can finish
+    current tasks before exiting. A second signal restores the default
+    behavior and forces the process to exit. Silently does nothing when
+    called outside the main thread. Returns the list of installed signals.
+    """
+    state = {'received': False}
+
+    def handler(signum, frame):
+        if state['received']:
+            # second signal: force exit with default behavior
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        state['received'] = True
+        if logger:
+            logger.info('received signal %s, shutting down gracefully '
+                        '(waiting for current tasks to finish)...', signum)
+        quit_func()
+
+    installed = []
+    for name in signals:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # not in main thread or signal not supported on this platform
+            continue
+        installed.append(name)
+    return installed
 
 
 def run_in_subprocess(func, *args, **kwargs):

@@ -16,8 +16,9 @@ from collections import deque
 from six import iteritems, itervalues
 from six.moves import queue as Queue
 
-from pyspider.libs import counter, utils
+from pyspider.libs import counter, metrics, utils
 from pyspider.libs.base_handler import BaseHandler
+from pyspider.libs.log import log_event, new_request_id, set_request_id
 from .task_queue import TaskQueue
 
 logger = logging.getLogger('scheduler')
@@ -137,7 +138,7 @@ class Project(object):
         return self.db_status in ('RUNNING', 'DEBUG')
 
 
-class Scheduler(object):
+class Scheduler(metrics.MetricsServerMixin, object):
     UPDATE_PROJECT_INTERVAL = 5 * 60
     default_schedule = {
         'priority': 0,
@@ -198,6 +199,17 @@ class Scheduler(object):
             "all": counter.CounterManager(
                 lambda: counter.TotalCounter()),
         }
+
+        self.metrics = metrics.default_registry
+        self._metrics_tasks_total = self.metrics.counter(
+            'pyspider_scheduler_tasks_total',
+            'Total tasks handled by scheduler', ('project', 'status'))
+        self._metrics_task_latency = self.metrics.histogram(
+            'pyspider_scheduler_task_latency_seconds',
+            'Task latency in seconds by stage', ('project', 'stage'))
+        self._metrics_queue_size = self.metrics.gauge(
+            'pyspider_scheduler_queue_size',
+            'Number of tasks waiting in scheduler queues')
         self._cnt['1h'].load(os.path.join(self.data_path, 'scheduler.1h'))
         self._cnt['1d'].load(os.path.join(self.data_path, 'scheduler.1d'))
         self._cnt['all'].load(os.path.join(self.data_path, 'scheduler.all'))
@@ -337,6 +349,8 @@ class Scheduler(object):
 
         out queue may have size limit to prevent block, a send_buffer is used
         '''
+        if 'request_id' not in task:
+            task['request_id'] = new_request_id()
         try:
             self.out_queue.put_nowait(task)
         except Queue.Full:
@@ -673,11 +687,16 @@ class Scheduler(object):
     def run(self):
         '''Start scheduler loop'''
         logger.info("scheduler starting...")
+        log_event(logger, logging.INFO, 'scheduler_start',
+                  loop_interval=self.LOOP_INTERVAL)
+        utils.install_graceful_shutdown(self.quit, logger)
+        self.start_metrics_server(health_check=lambda: not self._quit)
 
         while not self._quit:
             try:
                 time.sleep(self.LOOP_INTERVAL)
                 self.run_once()
+                self._metrics_queue_size.set(len(self))
                 self._exceptions = 0
             except KeyboardInterrupt:
                 break
@@ -688,7 +707,9 @@ class Scheduler(object):
                     break
                 continue
 
+        self.stop_metrics_server()
         logger.info("scheduler exiting...")
+        log_event(logger, logging.INFO, 'scheduler_exit')
         self._dump_cnt()
 
     def trigger_on_start(self, project):
@@ -888,6 +909,9 @@ class Scheduler(object):
 
     def on_task_status(self, task):
         '''Called when a status pack is arrived'''
+        request_id = task.get('track', {}).get('request_id')
+        if request_id:
+            set_request_id(request_id)
         try:
             procesok = task['track']['process']['ok']
             if not self.projects[task['project']].task_queue.done(task['taskid']):
@@ -905,9 +929,13 @@ class Scheduler(object):
         if task['track']['fetch'].get('time'):
             self._cnt['5m_time'].event((task['project'], 'fetch_time'),
                                        task['track']['fetch']['time'])
+            self._metrics_task_latency.labels(task['project'], 'fetch').observe(
+                task['track']['fetch']['time'])
         if task['track']['process'].get('time'):
             self._cnt['5m_time'].event((task['project'], 'process_time'),
                                        task['track']['process'].get('time'))
+            self._metrics_task_latency.labels(task['project'], 'process').observe(
+                task['track']['process']['time'])
         self.projects[task['project']].active_tasks.appendleft((time.time(), task))
         return ret
 
@@ -931,7 +959,10 @@ class Scheduler(object):
         self._cnt['1h'].event((project, 'success'), +1)
         self._cnt['1d'].event((project, 'success'), +1)
         self._cnt['all'].event((project, 'success'), +1).event((project, 'pending'), -1)
+        self._metrics_tasks_total.labels(project, 'success').inc()
         logger.info('task done %(project)s:%(taskid)s %(url)s', task)
+        log_event(logger, logging.INFO, 'task_done',
+                  project=project, taskid=task.get('taskid'), url=task.get('url'))
         return task
 
     def on_task_failed(self, task):
@@ -969,7 +1000,10 @@ class Scheduler(object):
             self._cnt['1h'].event((project, 'failed'), +1)
             self._cnt['1d'].event((project, 'failed'), +1)
             self._cnt['all'].event((project, 'failed'), +1).event((project, 'pending'), -1)
+            self._metrics_tasks_total.labels(project, 'failed').inc()
             logger.info('task failed %(project)s:%(taskid)s %(url)s' % task)
+            log_event(logger, logging.INFO, 'task_failed',
+                      project=project, taskid=task.get('taskid'), url=task.get('url'))
             return task
         else:
             task['schedule']['retried'] = retried + 1
@@ -983,6 +1017,7 @@ class Scheduler(object):
             self._cnt['1h'].event((project, 'retry'), +1)
             self._cnt['1d'].event((project, 'retry'), +1)
             # self._cnt['all'].event((project, 'retry'), +1)
+            self._metrics_tasks_total.labels(project, 'retry').inc()
             logger.info('task retry %d/%d %%(project)s:%%(taskid)s %%(url)s' % (
                 retried, retries), task)
             return task

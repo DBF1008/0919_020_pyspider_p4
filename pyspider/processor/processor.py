@@ -13,8 +13,9 @@ import traceback
 logger = logging.getLogger("processor")
 
 from six.moves import queue as Queue
-from pyspider.libs import utils
-from pyspider.libs.log import LogFormatter
+from pyspider.libs import metrics, utils
+from pyspider.libs.log import (
+    LogFormatter, log_event, ensure_request_id, get_request_id, set_request_id)
 from pyspider.libs.utils import pretty_unicode, hide_me
 from pyspider.libs.response import rebuild_response
 from .project_module import ProjectManager, ProjectFinder
@@ -59,7 +60,7 @@ class ProcessorResult(object):
         return u''.join(result)
 
 
-class Processor(object):
+class Processor(metrics.MetricsServerMixin, object):
     PROCESS_TIME_LIMIT = 30
     EXCEPTION_LIMIT = 3
 
@@ -85,6 +86,14 @@ class Processor(object):
             process_time_limit=process_time_limit,
         ))
 
+        self.metrics = metrics.default_registry
+        self._metrics_tasks_total = self.metrics.counter(
+            'pyspider_processor_tasks_total',
+            'Total tasks processed', ('project', 'status'))
+        self._metrics_task_duration = self.metrics.histogram(
+            'pyspider_processor_task_duration_seconds',
+            'Task process latency in seconds', ('project',))
+
         if enable_projects_import:
             self.enable_projects_import()
 
@@ -101,6 +110,8 @@ class Processor(object):
 
     def on_task(self, task, response):
         '''Deal one task'''
+        previous_request_id = get_request_id()
+        request_id = ensure_request_id(task)
         start_time = time.time()
         response = rebuild_response(response)
 
@@ -137,6 +148,7 @@ class Processor(object):
                 'project': task['project'],
                 'url': task.get('url'),
                 'track': {
+                    'request_id': request_id,
                     'fetch': {
                         'ok': response.isok(),
                         'redirect_url': response.url if response.url != response.orig_url else None,
@@ -200,6 +212,18 @@ class Processor(object):
             task['project'], task['taskid'],
             task.get('url'), response.status_code, len(response.content),
             ret.result, len(ret.follows), len(ret.messages), ret.exception))
+        self._metrics_tasks_total.labels(
+            task['project'], 'error' if ret.exception else 'success').inc()
+        self._metrics_task_duration.labels(task['project']).observe(process_time)
+        log_event(logger,
+                  logging.ERROR if ret.exception else logging.INFO,
+                  'process_done',
+                  project=task['project'], taskid=task['taskid'],
+                  url=task.get('url'), status_code=response.status_code,
+                  process_time=process_time, follows=len(ret.follows),
+                  messages=len(ret.messages),
+                  exception=repr(ret.exception) if ret.exception else None)
+        set_request_id(previous_request_id)
         return True
 
     def quit(self):
@@ -209,6 +233,9 @@ class Processor(object):
     def run(self):
         '''Run loop'''
         logger.info("processor starting...")
+        log_event(logger, logging.INFO, 'processor_start')
+        utils.install_graceful_shutdown(self.quit, logger)
+        self.start_metrics_server(health_check=lambda: not self._quit)
 
         while not self._quit:
             try:
@@ -226,4 +253,6 @@ class Processor(object):
                     break
                 continue
 
+        self.stop_metrics_server()
         logger.info("processor exiting...")
+        log_event(logger, logging.INFO, 'processor_exit')

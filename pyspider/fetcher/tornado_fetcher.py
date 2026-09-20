@@ -30,7 +30,8 @@ from tornado import gen
 from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 
-from pyspider.libs import utils, dataurl, counter
+from pyspider.libs import utils, dataurl, counter, metrics
+from pyspider.libs.log import log_event, ensure_request_id, clear_request_id
 from pyspider.libs.url import quote_chinese
 from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
@@ -63,8 +64,9 @@ fetcher_output = {
 }
 
 
-class Fetcher(object):
+class Fetcher(metrics.MetricsServerMixin, object):
     user_agent = "pyspider/%s (+http://pyspider.org/)" % pyspider.__version__
+    GRACEFUL_SHUTDOWN_TIMEOUT = 30
     default_options = {
         'method': 'GET',
         'headers': {
@@ -105,6 +107,17 @@ class Fetcher(object):
                 lambda: counter.TimebaseAverageWindowCounter(60, 60)),
         }
 
+        self.metrics = metrics.default_registry
+        self._metrics_requests_total = self.metrics.counter(
+            'pyspider_fetcher_requests_total',
+            'Total fetch requests', ('project', 'fetch_type', 'status'))
+        self._metrics_request_duration = self.metrics.histogram(
+            'pyspider_fetcher_request_duration_seconds',
+            'Fetch request latency in seconds', ('project', 'fetch_type'))
+        self._metrics_inflight = self.metrics.gauge(
+            'pyspider_fetcher_inflight_requests',
+            'Number of in-flight fetch requests')
+
     def send_result(self, type, task, result):
         '''Send fetch result to processor'''
         if self.outqueue:
@@ -126,8 +139,12 @@ class Fetcher(object):
         if callback is None:
             callback = self.send_result
 
+        ensure_request_id(task)
         type = 'None'
         start_time = time.time()
+        self._metrics_inflight.inc()
+        log_event(logger, logging.INFO, 'fetch_start',
+                  project=task.get('project'), taskid=task.get('taskid'), url=url)
         try:
             if url.startswith('data:'):
                 type = 'data'
@@ -147,6 +164,23 @@ class Fetcher(object):
         except Exception as e:
             logger.exception(e)
             result = self.handle_error(type, url, task, start_time, e)
+        finally:
+            self._metrics_inflight.dec()
+
+        latency = time.time() - start_time
+        status_code = result.get('status_code', 599)
+        status_class = '%dxx' % (int(status_code) // 100) if status_code != 599 else 'error'
+        self._metrics_requests_total.labels(
+            task.get('project'), type, status_class).inc()
+        self._metrics_request_duration.labels(
+            task.get('project'), type).observe(latency)
+        log_event(logger,
+                  logging.INFO if status_code != 599 else logging.ERROR,
+                  'fetch_done',
+                  project=task.get('project'), taskid=task.get('taskid'),
+                  url=url, fetch_type=type, status_code=status_code,
+                  latency=latency)
+        clear_request_id()
 
         callback(type, task, result)
         self.on_result(type, task, result)
@@ -743,6 +777,9 @@ class Fetcher(object):
     def run(self):
         '''Run loop'''
         logger.info("fetcher starting...")
+        log_event(logger, logging.INFO, 'fetcher_start', poolsize=self.poolsize)
+        utils.install_graceful_shutdown(self.quit, logger)
+        self.start_metrics_server(health_check=lambda: not self._quit)
 
         def queue_loop():
             if not self.outqueue or not self.inqueue:
@@ -775,13 +812,32 @@ class Fetcher(object):
         except KeyboardInterrupt:
             pass
 
+        self.stop_metrics_server()
         logger.info("fetcher exiting...")
+        log_event(logger, logging.INFO, 'fetcher_exit')
 
     def quit(self):
-        '''Quit fetcher'''
+        '''Quit fetcher gracefully, wait for in-flight fetches to finish'''
+        was_running = self._running
         self._running = False
         self._quit = True
-        self.ioloop.add_callback(self.ioloop.stop)
+        if was_running:
+            # stop consuming new tasks (queue_loop checks self._quit), then
+            # wait for in-flight fetches to finish before stopping the ioloop
+            deadline = time.time() + self.GRACEFUL_SHUTDOWN_TIMEOUT
+
+            def _stop_when_idle():
+                inflight = self.http_client.size()
+                if inflight <= 0 or time.time() >= deadline:
+                    if inflight > 0:
+                        logger.warning(
+                            'graceful shutdown timeout, %d fetches aborted', inflight)
+                    self.ioloop.stop()
+                else:
+                    self.ioloop.call_later(0.1, _stop_when_idle)
+            self.ioloop.add_callback(_stop_when_idle)
+        else:
+            self.ioloop.add_callback(self.ioloop.stop)
         if hasattr(self, 'xmlrpc_server'):
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_ioloop.stop)
