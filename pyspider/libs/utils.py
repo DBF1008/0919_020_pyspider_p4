@@ -69,6 +69,61 @@ def run_in_subprocess(func, *args, **kwargs):
     return thread
 
 
+def register_graceful_shutdown(handler, signals=None, logger=None):
+    """
+    Register SIGTERM/SIGINT handler for graceful shutdown.
+
+    Signal handlers can only be registered in the main thread, when
+    called from other threads (e.g. components run in thread mode)
+    this function does nothing and returns False.
+    """
+    import signal
+    if hasattr(threading, 'main_thread'):
+        if threading.current_thread() is not threading.main_thread():
+            return False
+    elif threading.current_thread().__class__.__name__ != '_MainThread':
+        return False
+    if signals is None:
+        signals = []
+        for name in ('SIGTERM', 'SIGINT'):
+            if hasattr(signal, name):
+                signals.append(getattr(signal, name))
+
+    def _handler(signum, frame):
+        if logger:
+            logger.info('received signal %s, shutting down gracefully...', signum)
+        handler(signum, frame)
+
+    for sig in signals:
+        signal.signal(sig, _handler)
+    return True
+
+
+def new_periodic_callback(callback, callback_time, io_loop=None):
+    """Create tornado PeriodicCallback, compatible with tornado>=6
+    which removed the io_loop keyword argument."""
+    import tornado.ioloop
+    try:
+        return tornado.ioloop.PeriodicCallback(callback, callback_time,
+                                               io_loop=io_loop)
+    except TypeError:
+        if io_loop is not None:
+            io_loop.make_current()
+        return tornado.ioloop.PeriodicCallback(callback, callback_time)
+
+
+def new_httpserver(application, io_loop=None):
+    """Create tornado HTTPServer, compatible with tornado>=6
+    which removed the io_loop keyword argument."""
+    import tornado.httpserver
+    try:
+        return tornado.httpserver.HTTPServer(application, io_loop=io_loop)
+    except TypeError:
+        if io_loop is not None:
+            io_loop.make_current()
+        return tornado.httpserver.HTTPServer(application)
+
+
 def format_date(date, gmt_offset=0, relative=True, shorter=False, full_format=False):
     """Formats the given date (which should be GMT).
 

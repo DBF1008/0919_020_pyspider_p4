@@ -173,6 +173,15 @@ def cli(ctx, **kwargs):
     ctx.obj['instances'] = []
     ctx.obj.update(kwargs)
 
+    # graceful shutdown: quit all started components on SIGTERM/SIGINT
+    def _quit_instances(*args):
+        for each in ctx.obj.get('instances', []):
+            try:
+                each.quit()
+            except Exception:
+                pass
+    utils.register_graceful_shutdown(_quit_instances)
+
     if ctx.invoked_subcommand is None and not ctx.obj.get('testing_mode'):
         ctx.invoke(all)
     return ctx
@@ -194,10 +203,13 @@ def cli(ctx, **kwargs):
 @click.option('--scheduler-cls', default='pyspider.scheduler.ThreadBaseScheduler', callback=load_cls,
               help='scheduler class to be used.')
 @click.option('--threads', default=None, help='thread number for ThreadBaseScheduler, default: 4')
+@click.option('--metrics-host', default='127.0.0.1', help='metrics/health http server bind host')
+@click.option('--metrics-port', envvar='SCHEDULER_METRICS_PORT', default=23334,
+              help='metrics/health http server port, 0 to disable')
 @click.pass_context
 def scheduler(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port,
               inqueue_limit, delete_time, active_tasks, loop_limit, fail_pause_num,
-              scheduler_cls, threads, get_object=False):
+              scheduler_cls, threads, metrics_host, metrics_port, get_object=False):
     """
     Run Scheduler, only one scheduler is allowed.
     """
@@ -216,6 +228,8 @@ def scheduler(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port,
     scheduler.ACTIVE_TASKS = active_tasks
     scheduler.LOOP_LIMIT = loop_limit
     scheduler.FAIL_PAUSE_NUM = fail_pause_num
+    scheduler.metrics_host = metrics_host
+    scheduler.metrics_port = metrics_port
 
     g.instances.append(scheduler)
     if g.get('testing_mode') or get_object:
@@ -241,10 +255,13 @@ def scheduler(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port,
 @click.option('--splash-endpoint', help="execute endpoint of splash: http://splash.readthedocs.io/en/stable/api.html#execute")
 @click.option('--fetcher-cls', default='pyspider.fetcher.Fetcher', callback=load_cls,
               help='Fetcher class to be used.')
+@click.option('--metrics-host', default='127.0.0.1', help='metrics/health http server bind host')
+@click.option('--metrics-port', envvar='FETCHER_METRICS_PORT', default=24445,
+              help='metrics/health http server port, 0 to disable')
 @click.pass_context
 def fetcher(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port, poolsize, proxy, user_agent,
             timeout, phantomjs_endpoint, puppeteer_endpoint, splash_endpoint, fetcher_cls,
-            async_mode=True, get_object=False, no_input=False):
+            metrics_host, metrics_port, async_mode=True, get_object=False, no_input=False):
     """
     Run Fetcher.
     """
@@ -267,6 +284,8 @@ def fetcher(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port, poolsize, proxy, u
     if timeout:
         fetcher.default_options = copy.deepcopy(fetcher.default_options)
         fetcher.default_options['timeout'] = timeout
+    fetcher.metrics_host = metrics_host
+    fetcher.metrics_port = metrics_port
 
     g.instances.append(fetcher)
     if g.get('testing_mode') or get_object:
@@ -282,8 +301,12 @@ def fetcher(ctx, xmlrpc, no_xmlrpc, xmlrpc_host, xmlrpc_port, poolsize, proxy, u
 @click.option('--processor-cls', default='pyspider.processor.Processor',
               callback=load_cls, help='Processor class to be used.')
 @click.option('--process-time-limit', default=30, help='script process time limit')
+@click.option('--metrics-host', default='127.0.0.1', help='metrics/health http server bind host')
+@click.option('--metrics-port', envvar='PROCESSOR_METRICS_PORT', default=24446,
+              help='metrics/health http server port, 0 to disable')
 @click.pass_context
-def processor(ctx, processor_cls, process_time_limit, enable_stdout_capture=True, get_object=False):
+def processor(ctx, processor_cls, process_time_limit, metrics_host, metrics_port,
+              enable_stdout_capture=True, get_object=False):
     """
     Run Processor.
     """
@@ -295,6 +318,8 @@ def processor(ctx, processor_cls, process_time_limit, enable_stdout_capture=True
                           newtask_queue=g.newtask_queue, result_queue=g.processor2result,
                           enable_stdout_capture=enable_stdout_capture,
                           process_time_limit=process_time_limit)
+    processor.metrics_host = metrics_host
+    processor.metrics_port = metrics_port
 
     g.instances.append(processor)
     if g.get('testing_mode') or get_object:

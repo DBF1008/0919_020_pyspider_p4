@@ -31,6 +31,8 @@ from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 
 from pyspider.libs import utils, dataurl, counter
+from pyspider.libs import metrics as metrics_lib
+from pyspider.libs import slog
 from pyspider.libs.url import quote_chinese
 from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
@@ -93,8 +95,14 @@ class Fetcher(object):
 
         # binding io_loop to http_client here
         if self.async_mode:
-            self.http_client = MyCurlAsyncHTTPClient(max_clients=self.poolsize,
-                                                     io_loop=self.ioloop)
+            try:
+                self.http_client = MyCurlAsyncHTTPClient(max_clients=self.poolsize,
+                                                         io_loop=self.ioloop)
+            except TypeError:
+                # tornado>=6 removed the io_loop keyword argument,
+                # the client binds to the current ioloop instead
+                self.ioloop.make_current()
+                self.http_client = MyCurlAsyncHTTPClient(max_clients=self.poolsize)
         else:
             self.http_client = tornado.httpclient.HTTPClient(MyCurlAsyncHTTPClient, max_clients=self.poolsize)
 
@@ -104,6 +112,41 @@ class Fetcher(object):
             '1h': counter.CounterManager(
                 lambda: counter.TimebaseAverageWindowCounter(60, 60)),
         }
+
+        # unified metrics, exposed via /metrics (prometheus) and /health
+        self.metrics = metrics_lib.MetricsRegistry('fetcher')
+        self.metrics_host = '127.0.0.1'
+        self.metrics_port = 0
+        self._metrics_server = None
+        self._metric_requests = self.metrics.counter(
+            'fetcher_requests_total', 'Fetch requests by result')
+        self._metric_latency = self.metrics.histogram(
+            'fetcher_request_duration_seconds', 'Fetch latency in seconds')
+        self._metric_inflight = self.metrics.gauge(
+            'fetcher_inflight_requests', 'In-flight fetch requests')
+
+    def _start_metrics_server(self):
+        if self._metrics_server is None and self.metrics_port:
+            try:
+                self._metrics_server = metrics_lib.start_metrics_server(
+                    self.metrics_host, self.metrics_port, self.metrics,
+                    health_check=self._health_check, logger=logger)
+            except OSError:
+                logger.exception('cannot start metrics server on %s:%s',
+                                 self.metrics_host, self.metrics_port)
+
+    def _stop_metrics_server(self):
+        if self._metrics_server is not None:
+            self._metrics_server.shutdown()
+            self._metrics_server = None
+
+    def _health_check(self):
+        health = self.metrics.health()
+        health['inflight'] = self.http_client.size() \
+            if hasattr(self.http_client, 'size') else 0
+        health['free_size'] = self.http_client.free_size() \
+            if hasattr(self.http_client, 'free_size') else 0
+        return health
 
     def send_result(self, type, task, result):
         '''Send fetch result to processor'''
@@ -126,8 +169,18 @@ class Fetcher(object):
         if callback is None:
             callback = self.send_result
 
+        # get or inject request_id for full-link tracing
+        request_id = task.get('request_id')
+        if not request_id:
+            request_id = slog.new_request_id()
+            task['request_id'] = request_id
         type = 'None'
         start_time = time.time()
+        self._metric_inflight.inc()
+        slog.slog(logger, logging.INFO, 'fetch_start',
+                  request_id=request_id,
+                  fetch_type=task.get('fetch', {}).get('fetch_type', 'http'),
+                  **slog.task_log_fields(task))
         try:
             if url.startswith('data:'):
                 type = 'data'
@@ -148,6 +201,18 @@ class Fetcher(object):
             logger.exception(e)
             result = self.handle_error(type, url, task, start_time, e)
 
+        fetch_time = time.time() - start_time
+        status_code = result.get('status_code', 599)
+        ok = 200 <= status_code < 300 if isinstance(status_code, int) else False
+        self._metric_inflight.dec()
+        self._metric_requests.inc(
+            project=task.get('project'), type=type,
+            status='success' if ok else 'failed')
+        self._metric_latency.observe(fetch_time, project=task.get('project'))
+        slog.slog(logger, logging.INFO if ok else logging.WARNING, 'fetch_done',
+                  request_id=request_id,
+                  fetch_type=type, status_code=status_code, latency=fetch_time,
+                  **slog.task_log_fields(task))
         callback(type, task, result)
         self.on_result(type, task, result)
         raise gen.Return(result)
@@ -743,6 +808,8 @@ class Fetcher(object):
     def run(self):
         '''Run loop'''
         logger.info("fetcher starting...")
+        slog.slog(logger, logging.INFO, 'component_start', component='fetcher')
+        self._start_metrics_server()
 
         def queue_loop():
             if not self.outqueue or not self.inqueue:
@@ -766,21 +833,46 @@ class Fetcher(object):
                     logger.exception(e)
                     break
 
-        tornado.ioloop.PeriodicCallback(queue_loop, 100, io_loop=self.ioloop).start()
-        tornado.ioloop.PeriodicCallback(self.clear_robot_txt_cache, 10000, io_loop=self.ioloop).start()
+        utils.new_periodic_callback(queue_loop, 100, io_loop=self.ioloop).start()
+        utils.new_periodic_callback(self.clear_robot_txt_cache, 10000, io_loop=self.ioloop).start()
         self._running = True
+
+        # graceful shutdown: stop pulling new tasks, wait for in-flight
+        # fetches to finish, then stop the ioloop
+        utils.register_graceful_shutdown(
+            lambda *args: self.ioloop.add_callback(self.graceful_quit),
+            logger=logger)
 
         try:
             self.ioloop.start()
         except KeyboardInterrupt:
             pass
 
+        slog.slog(logger, logging.INFO, 'component_exit', component='fetcher')
         logger.info("fetcher exiting...")
+        self._stop_metrics_server()
+
+    def graceful_quit(self, timeout=30):
+        '''Stop accepting new tasks and quit after in-flight fetches done'''
+        self._quit = True
+        deadline = time.time() + timeout
+
+        def check_inflight():
+            inflight = self.http_client.size()
+            if inflight > 0 and time.time() < deadline:
+                logger.info('waiting for %d in-flight fetches to finish...', inflight)
+                return
+            self.quit()
+
+        checker = utils.new_periodic_callback(check_inflight, 100,
+                                              io_loop=self.ioloop)
+        checker.start()
 
     def quit(self):
         '''Quit fetcher'''
         self._running = False
         self._quit = True
+        self._stop_metrics_server()
         self.ioloop.add_callback(self.ioloop.stop)
         if hasattr(self, 'xmlrpc_server'):
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
@@ -819,7 +911,7 @@ class Fetcher(object):
 
         container = tornado.wsgi.WSGIContainer(application)
         self.xmlrpc_ioloop = tornado.ioloop.IOLoop()
-        self.xmlrpc_server = tornado.httpserver.HTTPServer(container, io_loop=self.xmlrpc_ioloop)
+        self.xmlrpc_server = utils.new_httpserver(container, io_loop=self.xmlrpc_ioloop)
         self.xmlrpc_server.listen(port=port, address=bind)
         logger.info('fetcher.xmlrpc listening on %s:%s', bind, port)
         self.xmlrpc_ioloop.start()

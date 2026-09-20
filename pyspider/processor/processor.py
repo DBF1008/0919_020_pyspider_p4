@@ -14,6 +14,8 @@ logger = logging.getLogger("processor")
 
 from six.moves import queue as Queue
 from pyspider.libs import utils
+from pyspider.libs import metrics as metrics_lib
+from pyspider.libs import slog
 from pyspider.libs.log import LogFormatter
 from pyspider.libs.utils import pretty_unicode, hide_me
 from pyspider.libs.response import rebuild_response
@@ -85,8 +87,39 @@ class Processor(object):
             process_time_limit=process_time_limit,
         ))
 
+        # unified metrics, exposed via /metrics (prometheus) and /health
+        self.metrics = metrics_lib.MetricsRegistry('processor')
+        self.metrics_host = '127.0.0.1'
+        self.metrics_port = 0
+        self._metrics_server = None
+        self._metric_tasks = self.metrics.counter(
+            'processor_tasks_total', 'Tasks processed by result')
+        self._metric_latency = self.metrics.histogram(
+            'processor_task_duration_seconds', 'Process latency in seconds')
+
         if enable_projects_import:
             self.enable_projects_import()
+
+    def _start_metrics_server(self):
+        if self._metrics_server is None and self.metrics_port:
+            try:
+                self._metrics_server = metrics_lib.start_metrics_server(
+                    self.metrics_host, self.metrics_port, self.metrics,
+                    health_check=self._health_check, logger=logger)
+            except OSError:
+                logger.exception('cannot start metrics server on %s:%s',
+                                 self.metrics_host, self.metrics_port)
+
+    def _stop_metrics_server(self):
+        if self._metrics_server is not None:
+            self._metrics_server.shutdown()
+            self._metrics_server = None
+
+    def _health_check(self):
+        health = self.metrics.health()
+        health['projects_loaded'] = len(self.project_manager.projects) \
+            if hasattr(self.project_manager, 'projects') else 0
+        return health
 
     def enable_projects_import(self):
         '''
@@ -102,6 +135,8 @@ class Processor(object):
     def on_task(self, task, response):
         '''Deal one task'''
         start_time = time.time()
+        # bind request_id for full-link tracing
+        slog.ensure_request_id(task)
         response = rebuild_response(response)
 
         try:
@@ -121,6 +156,15 @@ class Processor(object):
             logstr = traceback.format_exc()
             ret = ProcessorResult(logs=(logstr, ), exception=e)
         process_time = time.time() - start_time
+        self._metric_tasks.inc(project=task.get('project'),
+                               status='failed' if ret.exception else 'success')
+        self._metric_latency.observe(process_time, project=task.get('project'))
+        slog.slog(logger, logging.ERROR if ret.exception else logging.INFO,
+                  'process_done', latency=process_time,
+                  status_code=response.status_code,
+                  follows=len(ret.follows), messages=len(ret.messages),
+                  exception=repr(ret.exception) if ret.exception else None,
+                  **slog.task_log_fields(task))
 
         if not ret.extinfo.get('not_send_status', False):
             if ret.exception:
@@ -136,6 +180,7 @@ class Processor(object):
                 'taskid': task['taskid'],
                 'project': task['project'],
                 'url': task.get('url'),
+                'request_id': task.get('request_id'),
                 'track': {
                     'fetch': {
                         'ok': response.isok(),
@@ -205,10 +250,16 @@ class Processor(object):
     def quit(self):
         '''Set quit signal'''
         self._quit = True
+        self._stop_metrics_server()
 
     def run(self):
         '''Run loop'''
         logger.info("processor starting...")
+        slog.slog(logger, logging.INFO, 'component_start', component='processor')
+        self._start_metrics_server()
+
+        # graceful shutdown: finish current task then exit
+        utils.register_graceful_shutdown(lambda *args: self.quit(), logger=logger)
 
         while not self._quit:
             try:
@@ -226,4 +277,6 @@ class Processor(object):
                     break
                 continue
 
+        slog.slog(logger, logging.INFO, 'component_exit', component='processor')
         logger.info("processor exiting...")
+        self._stop_metrics_server()

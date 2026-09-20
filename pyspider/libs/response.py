@@ -5,14 +5,20 @@
 #         http://binux.me
 # Created on 2012-11-02 11:16:02
 
-import cgi
+try:
+    import cgi
+except ImportError:  # Python 3.13+ removed cgi module
+    cgi = None
 import re
 import six
 import json
 import chardet
 import lxml.html
 import lxml.etree
-from tblib import Traceback
+try:
+    from tblib import Traceback
+except ImportError:
+    Traceback = None
 from pyquery import PyQuery
 from requests.structures import CaseInsensitiveDict
 from requests import HTTPError
@@ -169,7 +175,9 @@ class Response(object):
             return
         elif self.error:
             if self.traceback:
-                six.reraise(Exception, Exception(self.error), Traceback.from_string(self.traceback).as_traceback())
+                if Traceback is not None:
+                    six.reraise(Exception, Exception(self.error), Traceback.from_string(self.traceback).as_traceback())
+                six.reraise(Exception, Exception(self.error))
             http_error = HTTPError(self.error)
         elif (self.status_code >= 300) and (self.status_code < 400) and not allow_redirects:
             http_error = HTTPError('%s Redirection' % (self.status_code))
@@ -214,7 +222,14 @@ def get_encoding(headers, content):
 
     content_type = headers.get('content-type')
     if content_type:
-        _, params = cgi.parse_header(content_type)
+        if cgi is not None:
+            _, params = cgi.parse_header(content_type)
+        else:
+            from email.message import Message
+            _msg = Message()
+            _msg['content-type'] = content_type
+            params = _msg.get_params(header='content-type', unquote=True)[1:]
+            params = dict(params)
         if 'charset' in params:
             encoding = params['charset'].strip("'\"")
 

@@ -146,7 +146,11 @@ class BaseHandler(object):
         """
         Running callback function with requested number of arguments
         """
-        args, varargs, keywords, defaults = inspect.getargspec(function)
+        if hasattr(inspect, 'getfullargspec'):
+            argspec = inspect.getfullargspec(function)
+            args = argspec.args
+        else:
+            args, varargs, keywords, defaults = inspect.getargspec(function)
         task = arguments[-1]
         process_time_limit = task['process'].get('process_time_limit',
                                                  self.__env__.get('process_time_limit', 0))

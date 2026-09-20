@@ -18,6 +18,8 @@ from six.moves import queue as Queue
 
 from pyspider.libs import counter, utils
 from pyspider.libs.base_handler import BaseHandler
+from pyspider.libs import metrics as metrics_lib
+from pyspider.libs import slog
 from .task_queue import TaskQueue
 
 logger = logging.getLogger('scheduler')
@@ -202,6 +204,42 @@ class Scheduler(object):
         self._cnt['1d'].load(os.path.join(self.data_path, 'scheduler.1d'))
         self._cnt['all'].load(os.path.join(self.data_path, 'scheduler.all'))
         self._last_dump_cnt = 0
+
+        # unified metrics, exposed via /metrics (prometheus) and /health
+        self.metrics = metrics_lib.MetricsRegistry('scheduler')
+        self.metrics_host = '127.0.0.1'
+        self.metrics_port = 0
+        self._metrics_server = None
+        self._setup_metrics()
+
+    def _setup_metrics(self):
+        self._metric_tasks = self.metrics.counter(
+            'scheduler_tasks_total', 'Tasks handled by scheduler')
+        self._metric_latency = self.metrics.histogram(
+            'scheduler_task_duration_seconds', 'Task stage latency in seconds')
+        self._metric_inqueue = self.metrics.gauge(
+            'scheduler_inqueue_tasks', 'Tasks waiting in project queues')
+
+    def _start_metrics_server(self):
+        if self._metrics_server is None and self.metrics_port:
+            try:
+                self._metrics_server = metrics_lib.start_metrics_server(
+                    self.metrics_host, self.metrics_port, self.metrics,
+                    health_check=self._health_check, logger=logger)
+            except OSError:
+                logger.exception('cannot start metrics server on %s:%s',
+                                 self.metrics_host, self.metrics_port)
+
+    def _stop_metrics_server(self):
+        if self._metrics_server is not None:
+            self._metrics_server.shutdown()
+            self._metrics_server = None
+
+    def _health_check(self):
+        health = self.metrics.health()
+        health['projects'] = len(self.projects)
+        health['inqueue'] = len(self)
+        return health
 
     def _update_projects(self):
         '''Check project update'''
@@ -624,6 +662,7 @@ class Scheduler(object):
         now = time.time()
         if now - self._last_dump_cnt > 60:
             self._last_dump_cnt = now
+            self._metric_inqueue.set(len(self))
             self._dump_cnt()
             self._print_counter_log()
 
@@ -653,6 +692,7 @@ class Scheduler(object):
     def quit(self):
         '''Set quit signal'''
         self._quit = True
+        self._stop_metrics_server()
         # stop xmlrpc server
         if hasattr(self, 'xmlrpc_server'):
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
@@ -673,6 +713,11 @@ class Scheduler(object):
     def run(self):
         '''Start scheduler loop'''
         logger.info("scheduler starting...")
+        slog.slog(logger, logging.INFO, 'component_start', component='scheduler')
+        self._start_metrics_server()
+
+        # graceful shutdown: finish current loop step then exit
+        utils.register_graceful_shutdown(lambda *args: self.quit(), logger=logger)
 
         while not self._quit:
             try:
@@ -688,7 +733,9 @@ class Scheduler(object):
                     break
                 continue
 
+        slog.slog(logger, logging.INFO, 'component_exit', component='scheduler')
         logger.info("scheduler exiting...")
+        self._stop_metrics_server()
         self._dump_cnt()
 
     def trigger_on_start(self, project):
@@ -805,7 +852,7 @@ class Scheduler(object):
 
         container = tornado.wsgi.WSGIContainer(application)
         self.xmlrpc_ioloop = tornado.ioloop.IOLoop()
-        self.xmlrpc_server = tornado.httpserver.HTTPServer(container, io_loop=self.xmlrpc_ioloop)
+        self.xmlrpc_server = utils.new_httpserver(container, io_loop=self.xmlrpc_ioloop)
         self.xmlrpc_server.listen(port=port, address=bind)
         logger.info('scheduler.xmlrpc listening on %s:%s', bind, port)
         self.xmlrpc_ioloop.start()
@@ -833,6 +880,7 @@ class Scheduler(object):
         self._cnt['1h'].event((project, 'pending'), +1)
         self._cnt['1d'].event((project, 'pending'), +1)
         self._cnt['all'].event((project, 'pending'), +1)
+        self._metric_tasks.inc(project=project, status='pending')
         logger.info('new task %(project)s:%(taskid)s %(url)s', task)
         return task
 
@@ -888,6 +936,7 @@ class Scheduler(object):
 
     def on_task_status(self, task):
         '''Called when a status pack is arrived'''
+        slog.ensure_request_id(task)
         try:
             procesok = task['track']['process']['ok']
             if not self.projects[task['project']].task_queue.done(task['taskid']):
@@ -908,6 +957,12 @@ class Scheduler(object):
         if task['track']['process'].get('time'):
             self._cnt['5m_time'].event((task['project'], 'process_time'),
                                        task['track']['process'].get('time'))
+        if task['track']['fetch'].get('time'):
+            self._metric_latency.observe(task['track']['fetch']['time'],
+                                         project=task['project'], stage='fetch')
+        if task['track']['process'].get('time'):
+            self._metric_latency.observe(task['track']['process']['time'],
+                                         project=task['project'], stage='process')
         self.projects[task['project']].active_tasks.appendleft((time.time(), task))
         return ret
 
@@ -931,6 +986,8 @@ class Scheduler(object):
         self._cnt['1h'].event((project, 'success'), +1)
         self._cnt['1d'].event((project, 'success'), +1)
         self._cnt['all'].event((project, 'success'), +1).event((project, 'pending'), -1)
+        self._metric_tasks.inc(project=project, status='success')
+        slog.slog(logger, logging.INFO, 'task_done', **slog.task_log_fields(task))
         logger.info('task done %(project)s:%(taskid)s %(url)s', task)
         return task
 
@@ -969,6 +1026,9 @@ class Scheduler(object):
             self._cnt['1h'].event((project, 'failed'), +1)
             self._cnt['1d'].event((project, 'failed'), +1)
             self._cnt['all'].event((project, 'failed'), +1).event((project, 'pending'), -1)
+            self._metric_tasks.inc(project=project, status='failed')
+            slog.slog(logger, logging.WARNING, 'task_failed',
+                      retried=retried, **slog.task_log_fields(task))
             logger.info('task failed %(project)s:%(taskid)s %(url)s' % task)
             return task
         else:
@@ -983,12 +1043,19 @@ class Scheduler(object):
             self._cnt['1h'].event((project, 'retry'), +1)
             self._cnt['1d'].event((project, 'retry'), +1)
             # self._cnt['all'].event((project, 'retry'), +1)
+            self._metric_tasks.inc(project=project, status='retry')
+            slog.slog(logger, logging.INFO, 'task_retry',
+                      retried=retried + 1, retries=retries, **slog.task_log_fields(task))
             logger.info('task retry %d/%d %%(project)s:%%(taskid)s %%(url)s' % (
                 retried, retries), task)
             return task
 
     def on_select_task(self, task):
         '''Called when a task is selected to fetch & process'''
+        # inject request_id for full-link tracing
+        slog.ensure_request_id(task)
+        self._metric_tasks.inc(project=task['project'], status='selected')
+        slog.slog(logger, logging.INFO, 'task_selected', **slog.task_log_fields(task))
         # inject informations about project
         logger.info('select %(project)s:%(taskid)s %(url)s', task)
 
@@ -1169,8 +1236,10 @@ class OneScheduler(Scheduler):
 
     def run(self):
         import tornado.ioloop
-        tornado.ioloop.PeriodicCallback(self.run_once, 100,
-                                        io_loop=self.ioloop).start()
+        utils.new_periodic_callback(self.run_once, 100,
+                                    io_loop=self.ioloop).start()
+        utils.register_graceful_shutdown(
+            lambda *args: self.ioloop.add_callback(self.quit), logger=logger)
         self.ioloop.start()
 
     def quit(self):
